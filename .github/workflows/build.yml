@@ -270,6 +270,21 @@ jobs:
  
           test -s "$WORK/prod.keys"
 
+      - name: Inspect APFS Storage
+        shell: bash
+        run: |
+          echo "===== Disk Layout ====="
+          diskutil list
+
+          echo "===== APFS Containers and Volumes ====="
+          diskutil apfs list
+
+          echo "===== Root Volume Details ====="
+          diskutil info /
+
+          echo "===== Filesystem Usage ====="
+          df -h /
+
       - name: Clean Up Original Game Downloads
         shell: bash
         run: |
