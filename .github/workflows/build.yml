@@ -269,6 +269,29 @@ jobs:
           PY
  
           test -s "$WORK/prod.keys"
+
+            - name: Clean Up Original Game Downloads
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WORK="$RUNNER_TEMP/nxnative"
+          GAME_DIR="$RUNNER_TEMP/GameFiles"
+
+          echo "===== Before Cleanup ====="
+          df -h /
+
+          echo "===== Removing Original Downloads ====="
+          rm -f "$WORK"/*.download
+
+          echo "===== Removing Extracted RAR Directories ====="
+          rm -rf "$WORK"/extracted-*
+
+          echo "===== Keeping Game Packages ====="
+          ls -lh "$GAME_DIR"
+
+          echo "===== After Cleanup ====="
+          df -h /
  
       - name: Detect game title ID and select shader profile
         env:
