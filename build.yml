@@ -1,0 +1,548 @@
+
+name: NxNative - Generic IPA Builder
+ 
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: "Choose the target device and texture support path"
+        required: true
+        type: choice
+        default: "iPhone 15 or older (BC fallback)"
+        options:
+          - "iPhone 15 or older (BC fallback)"
+          - "iPhone 15 Pro/Pro Max or newer (standard)"
+      profile_id:
+        description: "Base game title ID (manual override; clear for automatic detection)"
+        required: false
+        type: string
+        default: "0100DCA0064A2000"
+ 
+permissions:
+  contents: read
+ 
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 360
+ 
+    steps:
+      - name: Checkout BC fallback version
+        if: inputs.device == 'iPhone 15 or older (BC fallback)'
+        uses: actions/checkout@v4
+        with:
+          repository: mianmuhammadse/nxnative
+          ref: d158df611bf2f3fa315c4f16585575cdfdb2a1d3
+ 
+      - name: Checkout standard nxnative version
+        if: inputs.device == 'iPhone 15 Pro/Pro Max or newer (standard)'
+        uses: actions/checkout@v4
+        with:
+          repository: seedds/nxnative
+          ref: main
+ 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+ 
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+ 
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install glslang xcodegen zstd spirv-cross unar
+          python -m pip install --upgrade pip
+          python -m pip install \
+            lz4 capstone fonttools backports.zstd gdown
+ 
+      - name: Download game files and keys
+        env:
+          GAME_URL: ${{ secrets.Game_URL }}
+          UPDATE_URL: ${{ secrets.Update_URL }}
+          DLC_URL: ${{ secrets.DLC_URL }}
+          KEYS_URL: ${{ secrets.Keys_URL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/nxnative"
+          mkdir -p "$WORK"
+ 
+          download_file() {
+            local url="$1"
+            local output="$2"
+
+            if [[ -z "${url:-}" ]]; then
+              echo "::error::A required download URL is empty."
+              exit 1
+            fi
+
+            echo "Downloading $(basename "$output")..."
+            for attempt in 1 2 3; do
+              if gdown --continue "$url" -O "$output" \
+                && [[ -s "$output" ]]; then
+                file "$output"
+                return
+              fi
+
+              echo "Download attempt $attempt failed; retrying..."
+              sleep $((attempt * 10))
+            done
+
+            echo "::error::Failed to download $(basename "$output") after 3 attempts."
+            exit 1
+          }
+ 
+          download_file "$GAME_URL" "$WORK/game.download"
+          download_file "$KEYS_URL" "$WORK/prod.keys"
+ 
+          if [[ -n "${UPDATE_URL:-}" ]]; then
+            download_file "$UPDATE_URL" "$WORK/update.download"
+          else
+            echo "No UPDATE_URL configured; continuing without an update."
+          fi
+ 
+          if [[ -n "${DLC_URL:-}" ]]; then
+            download_file "$DLC_URL" "$WORK/dlc.download"
+          else
+            echo "No DLC_URL configured; continuing without DLC."
+          fi
+ 
+          chmod 600 "$WORK/prod.keys"
+ 
+      - name: Extract RAR archives or accept direct game packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/nxnative"
+          GAME_DIR="$RUNNER_TEMP/GameFiles"
+          mkdir -p "$GAME_DIR"
+ 
+          python - "$WORK" "$GAME_DIR" <<'PY'
+          import shutil
+          import subprocess
+          import sys
+          from pathlib import Path
+ 
+          work = Path(sys.argv[1])
+          game_dir = Path(sys.argv[2])
+          package_extensions = {
+              ".nsp", ".xci", ".nsz", ".xcz"
+          }
+          rar_signatures = (
+              b"Rar!\x1a\x07\x00",
+              b"Rar!\x1a\x07\x01\x00",
+          )
+ 
+          def read_magic(path, offset=0):
+              with path.open("rb") as f:
+                  f.seek(offset)
+                  return f.read(4)
+
+          def validate_package(path):
+              suffix = path.suffix.lower()
+              magic = read_magic(path)
+
+              if suffix in (".nsp", ".nsz") and magic != b"PFS0":
+                  raise SystemExit(
+                      f"Invalid {suffix} package signature: {path.name}"
+                  )
+
+              if suffix in (".xci", ".xcz") and read_magic(path, 0x100) != b"HEAD":
+                  raise SystemExit(
+                      f"Invalid {suffix} package signature: {path.name}"
+                  )
+ 
+          def add_package(source, label):
+              target = game_dir / source.name
+ 
+              if target.exists():
+                  raise SystemExit(
+                      "Duplicate package filename: " + source.name
+                  )
+ 
+              validate_package(source)
+              shutil.copy2(source, target)
+ 
+              print(
+                  f"Added {label}: {target.name} "
+                  f"({target.stat().st_size:,} bytes)"
+              )
+ 
+          def process_download(label):
+              source = work / f"{label}.download"
+ 
+              if not source.exists():
+                  print(f"No {label} download; skipping.")
+                  return
+ 
+              signature = read_magic(source)
+
+              is_rar = any(
+                  signature == magic[:4]
+                  for magic in rar_signatures
+              )
+ 
+              if is_rar:
+                  extract_dir = work / f"extracted-{label}"
+                  extract_dir.mkdir(parents=True, exist_ok=True)
+ 
+                  print(f"{label}: RAR archive detected; extracting.")
+ 
+                  subprocess.run(
+                      [
+                          "unar",
+                          "-o",
+                          str(extract_dir),
+                          str(source),
+                      ],
+                      check=True,
+                  )
+ 
+                  packages = sorted(
+                      p for p in extract_dir.rglob("*")
+                      if p.is_file()
+                      and p.suffix.lower() in package_extensions
+                  )
+ 
+                  if not packages:
+                      raise SystemExit(
+                          f"No NSP/XCI/NSZ/XCZ packages found "
+                          f"in the {label} RAR archive."
+                      )
+ 
+                  for package in packages:
+                      add_package(package, label)
+ 
+              else:
+                  print(
+                      f"{label}: not a RAR archive; "
+                      "checking as a direct package."
+                  )
+ 
+                  if signature == b"PFS0":
+                      extension = ".nsp"
+                  elif read_magic(source, 0x100) == b"HEAD":
+                      extension = ".xci"
+                  else:
+                      raise SystemExit(
+                          f"{label} is not a recognized RAR archive "
+                          "or direct NSP/XCI package. "
+                          "Direct downloads must be NSP or XCI files."
+                      )
+ 
+                  target = game_dir / f"{label}{extension}"
+ 
+                  if target.exists():
+                      raise SystemExit(
+                          f"Output package already exists: {target.name}"
+                      )
+ 
+                  shutil.copy2(source, target)
+                  validate_package(target)
+ 
+                  print(
+                      f"Added direct package: {target.name} "
+                      f"({target.stat().st_size:,} bytes)"
+                  )
+ 
+          process_download("game")
+          process_download("update")
+          process_download("dlc")
+ 
+          packages = sorted(
+              p for p in game_dir.iterdir()
+              if p.is_file()
+              and p.suffix.lower() in package_extensions
+          )
+ 
+          if not packages:
+              raise SystemExit("No game packages were prepared.")
+ 
+          print("\n=== Prepared game packages ===")
+          for package in packages:
+              print(f"{package.name}: {package.stat().st_size:,} bytes")
+          PY
+ 
+          test -s "$WORK/prod.keys"
+ 
+      - name: Detect game title ID and select shader profile
+        env:
+          PROFILE_OVERRIDE: ${{ inputs.profile_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          GAME_DIR="$RUNNER_TEMP/GameFiles"
+
+          if [[ -n "${PROFILE_OVERRIDE:-}" ]]; then
+            DETECTED_ID="$PROFILE_OVERRIDE"
+            echo "Using configured profile ID override: $DETECTED_ID"
+          else
+            DETECTED_ID="$(python - "$GAME_DIR" <<'PY'
+          import re
+          import struct
+          import sys
+          from pathlib import Path
+ 
+          root = Path(sys.argv[1])
+          extensions = {".nsp", ".xci", ".nsz", ".xcz"}
+
+          def container_names(path, offset, magic, entry_size, name_offset):
+              try:
+                  with path.open("rb") as f:
+                      f.seek(offset)
+                      header = f.read(16)
+
+                      if len(header) != 16 or header[:4] != magic:
+                          return []
+
+                      count, string_size = struct.unpack_from(
+                          "<II", header, 4
+                      )
+ 
+                      if count > 100000 or string_size > 100000000:
+                          return []
+ 
+                      entries = f.read(count * entry_size)
+                      strings = f.read(string_size)
+ 
+                      if len(entries) != count * entry_size:
+                          return []
+ 
+                      names = []
+ 
+                      for i in range(count):
+                          offset = struct.unpack_from(
+                              "<I", entries, i * entry_size + name_offset
+                          )[0]
+ 
+                          if offset >= len(strings):
+                              continue
+ 
+                          end = strings.find(b"\0", offset)
+ 
+                          if end < 0:
+                              continue
+ 
+                          names.append(
+                              strings[offset:end].decode(
+                                  errors="replace"
+                              )
+                          )
+ 
+                      return names
+ 
+              except (OSError, struct.error):
+                  return []
+
+          def pfs0_names(path):
+              return container_names(path, 0, b"PFS0", 0x18, 0x10)
+
+          def xci_names(path):
+              names = []
+              pending = [(0xF000, b"HFS0")]
+              visited = set()
+
+              try:
+                  with path.open("rb") as f:
+                      while pending:
+                          container_offset, magic = pending.pop()
+
+                          if container_offset in visited:
+                              continue
+                          visited.add(container_offset)
+
+                          f.seek(container_offset)
+                          header = f.read(16)
+
+                          if len(header) != 16 or header[:4] != magic:
+                              continue
+
+                          count, string_size = struct.unpack_from(
+                              "<II", header, 4
+                          )
+
+                          if count > 100000 or string_size > 100000000:
+                              continue
+
+                          entry_size = 0x40 if magic == b"HFS0" else 0x18
+                          name_offset = 0x10
+                          entries = f.read(count * entry_size)
+                          strings = f.read(string_size)
+                          data_offset = (
+                              container_offset
+                              + 0x10
+                              + count * entry_size
+                              + string_size
+                          )
+
+                          if len(entries) != count * entry_size:
+                              continue
+
+                          for i in range(count):
+                              entry = i * entry_size
+                              file_offset, file_size = struct.unpack_from(
+                                  "<QQ", entries, entry
+                              )
+                              name_start = struct.unpack_from(
+                                  "<I", entries, entry + name_offset
+                              )[0]
+
+                              if name_start >= len(strings):
+                                  continue
+
+                              name_end = strings.find(b"\0", name_start)
+                              if name_end < 0:
+                                  continue
+
+                              name = strings[name_start:name_end].decode(
+                                  errors="replace"
+                              )
+                              names.append(name)
+
+                              child_offset = data_offset + file_offset
+                              f.seek(child_offset)
+                              child_magic = f.read(4)
+                              if child_magic in (b"HFS0", b"PFS0"):
+                                  pending.append((child_offset, child_magic))
+
+              except (OSError, struct.error):
+                  return names
+
+              return names
+
+          candidates = set()
+          title_id_pattern = re.compile(
+              r"(?<![0-9A-Fa-f])([0-9A-Fa-f]{16})(?:[._-]|$)"
+          )
+
+          def add_candidate(value):
+              title_id = int(value, 16)
+
+              if (title_id & 0xFFF) == 0:
+                  candidates.add(f"{title_id:016X}")
+
+          for path in root.iterdir():
+              if not path.is_file() or path.suffix.lower() not in extensions:
+                  continue
+
+              names = pfs0_names(path)
+              if path.suffix.lower() in {".xci", ".xcz"}:
+                  names.extend(xci_names(path))
+
+              for name in names:
+                  match = re.fullmatch(
+                      r"([0-9A-Fa-f]{16})[0-9A-Fa-f]{16}\.tik",
+                      name,
+                  )
+
+                  if match:
+                      add_candidate(match.group(1))
+
+                  for match in title_id_pattern.finditer(name):
+                      add_candidate(match.group(1))
+
+              match = re.search(
+                  r"\[([0-9A-Fa-f]{16})\]",
+                  path.name,
+              )
+
+              if match:
+                  add_candidate(match.group(1))
+
+          if len(candidates) != 1:
+              raise SystemExit(
+                  "Could not uniquely identify the base game's title ID. "
+                  f"Candidates found: {sorted(candidates)}. "
+                  "Check the base NSP and its ticket/filename."
+              )
+
+          print(next(iter(candidates)))
+          PY
+            )"
+          fi
+
+          PROFILE_ID="${PROFILE_OVERRIDE:-$DETECTED_ID}"
+          PROFILE_ID="$(echo "$PROFILE_ID" | tr '[:lower:]' '[:upper:]')"
+ 
+          if [[ ! "$PROFILE_ID" =~ ^[0-9A-F]{16}$ ]]; then
+            echo "::error::Profile ID must be exactly 16 hexadecimal characters."
+            exit 1
+          fi
+ 
+          echo "Selected base title ID: $DETECTED_ID"
+          echo "Shader profile ID: $PROFILE_ID"
+          echo "DM_GAME=$PROFILE_ID" >> "$GITHUB_ENV"
+          echo "DETECTED_TITLE_ID=$DETECTED_ID" >> "$GITHUB_ENV"
+ 
+      - name: Update shader toolchain lock and header
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Preparing shader toolchain for profile $DM_GAME"
+ 
+          CHAIN_SCRIPT="$(
+            find . -name dmsh_chain.py -type f -print -quit
+          )"
+ 
+          if [[ -z "$CHAIN_SCRIPT" ]]; then
+            echo "::error::Could not find dmsh_chain.py"
+            exit 1
+          fi
+ 
+          python "$CHAIN_SCRIPT" --header
+ 
+      - name: Build unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/nxnative"
+          GAME_DIR="$RUNNER_TEMP/GameFiles"
+          OUTPUT="$RUNNER_TEMP/NxNative.ipa"
+ 
+          python scripts/build_ipa_from_nsp.py \
+            "$GAME_DIR" \
+            -k "$WORK/prod.keys" \
+            --allow-other-metal \
+            -o "$OUTPUT"
+ 
+          if [[ ! -s "$OUTPUT" ]]; then
+            echo "::error::IPA build did not produce an output file."
+            exit 1
+          fi
+ 
+          echo "IPA successfully created: $OUTPUT"
+          ls -lh "$OUTPUT"
+ 
+      - name: Upload IPA
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: NxNative-IPA-${{ inputs.device == 'iPhone 15 or older (BC fallback)' && 'BC-Fallback' || 'Standard' }}
+          path: ${{ runner.temp }}/NxNative.ipa
+          if-no-files-found: error
+          retention-days: 7
+ 
+      - name: Upload build logs if available
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: NxNative-Build-Logs
+          path: |
+            ${{ runner.temp }}/GameFiles/*_build/logs/
+            ${{ runner.temp }}/GameFiles/*_survey/
+          if-no-files-found: ignore
+          retention-days: 7
+ 
+      - name: Clean up downloaded files and keys
+        if: always()
+        shell: bash
+        run: |
+          rm -rf \
+            "$RUNNER_TEMP/nxnative" \
+            "$RUNNER_TEMP/GameFiles"
+            
