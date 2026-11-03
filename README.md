@@ -43,9 +43,9 @@ Digimon Story Cyber Sleuth: Complete Edition
 数码宝贝物语 网络侦探：完整版
 Donkey Kong Country Returns HD
 大金刚乡村归来高清版
-Donkey Kong Country: Tropical Freeze
+Donkey Kong Country: Tropical Freeze  
 大金刚乡村：热带冰冻
-DRAGON QUEST VII Reimagined
+DRAGON QUEST VII Reimagined  
 勇者斗恶龙 VII 再构想版
 DRAGON QUEST XI S: Echoes of an Elusive Age – Definitive Edition
 勇者斗恶龙 XI S：难以捉摸的时代回声 – 终极版
@@ -131,7 +131,7 @@ WARNING: Any game not on this list is not guaranteed to work. Even games on the 
 Use game dumps and keys you are legally entitled to use.
 使用你依法有权使用的游戏转储和密钥。
 
-2. What you need  2. 你需要什么
+3. What you need  2. 你需要什么
 Before starting, gather these items:
 开始前，收集以下物品：
 A GitHub account: https://github.com/
@@ -153,7 +153,7 @@ You do not need a Mac. GitHub Actions provides the cloud build machine.
 Keep your keys private. Do not post them publicly or share them with other people. Anyone with access to your keys may be able to access protected game content.
 保持钥匙私密。 请勿公开发布或与他人分享。任何拥有你密钥的人都可能访问受保护的游戏内容。
 
-3. Upload your files to Google Drive
+4. Upload your files to Google Drive
 3. 将你的文件上传到 Google Drive。
 Google Drive will host the files so the GitHub workflow can download them during the build.
 Google Drive 会托管这些文件，GitHub 工作流程可以在构建过程中下载。
