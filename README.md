@@ -2,8 +2,7 @@
 
 > 初学者指南：使用 Google Drive 托管游戏文件，并通过 GitHub Actions
 > 的云端 macOS 运行器构建 IPA。
-> 本文根据用户提供的指南整理，保留原文的步骤、术语和说明；仅调整
-> Markdown 结构、换行和明显的排版问题。
+> 本文根据用户提供的指南整理(https://www.reddit.com/r/NativePortsOniOS/comments/1xh334e/how_to_compile_switch_games_into_native_ios_apps/)
 
 ## 目录
 
