@@ -270,7 +270,7 @@ jobs:
  
           test -s "$WORK/prod.keys"
 
-            - name: Clean Up Original Game Downloads
+      - name: Clean Up Original Game Downloads
         shell: bash
         run: |
           set -euo pipefail
