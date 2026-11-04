@@ -34,6 +34,8 @@ from pathlib import Path
 MARKER_DM = "# NX_CI_DISK_GUARD_SAFE_CAS"
 LEGACY_MARKER_DM = "# NX_CI_DISK_GUARD_TEMP_CLEANUP"
 MARKER_IPA = "# NX_CI_DISK_GUARD_POST_SHADER_CLEANUP"
+MARKER_ROMFS_MAIN = "# NX_CI_DISK_GUARD_RELEASE_ROMFS_AFTER_SPLIT"
+MARKER_ROMFS_SH = "# NX_CI_DISK_GUARD_SKIP_MISSING_ROMFS_VALIDATION"
 
 
 def say(s: str) -> None:
@@ -157,52 +159,154 @@ def patch_dmsh_build(repo: Path) -> bool:
 
 
 def patch_ipa_builder(repo: Path) -> bool:
+    """Patch the standard NxNative builder for post-split RomFS release.
+
+    RomFS is released only after split_shaders() has returned successfully,
+    only for NVN games, and only when --romfs separate is selected. The
+    extracted control data/icon remain available to build_ipa.sh.
+    """
     p = repo / "scripts/build_ipa_from_nsp.py"
     if not p.is_file():
         raise RuntimeError(f"build_ipa_from_nsp.py not found: {p}")
     src = p.read_text(encoding="utf-8")
+    changed = False
 
-    if MARKER_IPA in src:
-        say("[patch] build_ipa_from_nsp.py already patched")
+    # Release the main-game RomFS image after shader_split.py has completed.
+    if MARKER_ROMFS_MAIN not in src:
+        anchor = "        if observed_glslc is not None: check_glslc_coverage(observed_glslc, g)\n"
+        if src.count(anchor) != 1:
+            raise RuntimeError(
+                "Could not find the unique post-split/pre-Metal anchor in "
+                f"{p}; no RomFS deletion patch was applied."
+            )
+        block = (
+            f"        {MARKER_ROMFS_MAIN}\n"
+            "        # NVN's split_shaders() has returned: the Metal compiler reads\n"
+            "        # shader/pkg and rewritten modules, not the original RomFS image.\n"
+            "        # Do not apply this to Vulkan/GL: their shader builders still read RomFS.\n"
+            "        if (os.environ.get('NX_CI_RELEASE_ROMFS') == '1'\n"
+            "                and romfs_mode == 'separate' and gfx == 'nvn'):\n"
+            "            _ci_seen_romfs = set()\n"
+            "            for _ci_version in sv:\n"
+            "                _ci_image = Path(rfs.source(dirs[_ci_version])).resolve()\n"
+            "                if _ci_image in _ci_seen_romfs:\n"
+            "                    continue\n"
+            "                _ci_seen_romfs.add(_ci_image)\n"
+            "                try:\n"
+            "                    _ci_image.relative_to(work.resolve())\n"
+            "                except ValueError:\n"
+            "                    raise BuildError(f'refusing to remove RomFS outside the build folder: {_ci_image}')\n"
+            "                if _ci_image.is_file():\n"
+            "                    _ci_size = _ci_image.stat().st_size\n"
+            "                    _ci_free_before = shutil.disk_usage(_ci_image.parent).free\n"
+            "                    _ci_image.unlink()\n"
+            "                    _ci_free_after = shutil.disk_usage(_ci_image.parent).free\n"
+            "                    _ci_delta = _ci_free_after - _ci_free_before\n"
+            "                    say(f'[CI disk guard] removed RomFS after shader split: {_ci_image} ({_ci_size / 2**30:.2f} GiB)')\n"
+            "                    say(f'[CI disk guard] disk free: {_ci_free_before / 2**30:.2f} -> {_ci_free_after / 2**30:.2f} GiB; actual increase: {_ci_delta / 2**30:+.2f} GiB')\n"
+            "                else:\n"
+            "                    say(f'[CI disk guard] RomFS is not a regular image file; kept: {_ci_image}')\n"
+        )
+        src = src.replace(anchor, anchor + block, 1)
+        changed = True
+        say("[patch] build_ipa_from_nsp.py: delete main RomFS image after successful NVN shader split")
+
+    # Keep the existing post-Metal cleanup of consumed Switch-side shader data.
+    if MARKER_IPA not in src:
+        lines = src.splitlines(keepends=True)
+        matches = [
+            i for i, line in enumerate(lines)
+            if re.search(r"^\s*ios\s*=\s*build_shaders\(", line)
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"Expected exactly one NVN `ios = build_shaders(...)` call in {p}; "
+                f"found {len(matches)}. No post-shader cleanup was added."
+            )
+        i = matches[0]
+        indent = re.match(r"^\s*", lines[i]).group(0)
+        block = (
+            f"{indent}{MARKER_IPA}\n"
+            f"{indent}# Metal build has returned successfully. Keep shader/ios for IPA packing.\n"
+            f"{indent}if os.environ.get('NX_CI_RELEASE_SHADER_SPACE') == '1':\n"
+            f"{indent}    for _ci_path in (sh / 'pkg', sh / 'cache'):\n"
+            f"{indent}        if _ci_path.is_dir():\n"
+            f"{indent}            say(f'[CI disk guard] removing consumed shader data: {{_ci_path}}')\n"
+            f"{indent}            shutil.rmtree(_ci_path)\n"
+        )
+        lines.insert(i + 1, block)
+        src = "".join(lines)
+        changed = True
+        say("[patch] build_ipa_from_nsp.py: retain shader/ios; remove shader/pkg and shader/cache after Metal")
+
+    # If RomFS was deliberately released, don't print a push command for a
+    # path that no longer exists. The caller supplies the matching image later.
+    if "NX_CI_DISK_GUARD_ROMFS_PUSH_NOTICE" not in src:
+        push_anchor = "    say('the game files are not in this build. Copy them to the phone once, with the app installed (it is needed again only when the image changed, a new game version or another extraction):')\n"
+        if src.count(push_anchor) != 1:
+            raise RuntimeError(f"Could not find the unique say_push_romfs() notice in {p}.")
+        push_block = (
+            "    # NX_CI_DISK_GUARD_ROMFS_PUSH_NOTICE\n"
+            "    if not os.path.isfile(image):\n"
+            "        say('RomFS image is not present on this runner (released after shader split). Supply the matching RomFS.img separately; no push command can be printed here.')\n"
+            "        return\n"
+        )
+        src = src.replace(push_anchor, push_block + push_anchor, 1)
+        changed = True
+        say("[patch] build_ipa_from_nsp.py: avoid printing a push_romfs command for a deleted image")
+
+    if changed:
+        p.write_text(src, encoding="utf-8")
+    else:
+        say("[patch] build_ipa_from_nsp.py already has all requested patches")
+    return changed
+
+
+def patch_build_ipa_sh(repo: Path) -> bool:
+    """Allow --romfs separate IPA builds when the image was released post-split.
+
+    The original marker validation remains mandatory whenever the image exists,
+    or whenever RomFS is bundled. Only a missing image with DM_COPY_ROMFS=NO
+    bypasses the check; in that case build_ipa.sh naturally omits romfs.id.
+    """
+    p = repo / "dm/ios/tools/build_ipa.sh"
+    if not p.is_file():
+        raise RuntimeError(f"build_ipa.sh not found: {p}")
+    src = p.read_text(encoding="utf-8")
+
+    if MARKER_ROMFS_SH in src:
+        say("[patch] build_ipa.sh already has the missing-RomFS separate-mode patch")
         return False
 
-    # Both the pinned BC fallback revision and current standard main have one
-    # NVN call assigning the iOS shader directory to `ios`. It is deliberately
-    # placed after build_shaders() returns: regression checks, c1/cb tables and
-    # chain pruning have already completed; build_ipa.sh consumes MSL_IOS only.
-    lines = src.splitlines(keepends=True)
-    matches = [i for i, line in enumerate(lines) if re.search(r"^\s*ios\s*=\s*build_shaders\(", line)]
-    if len(matches) != 1:
+    anchor = 'python3 "$DM/tools/romfs.py" "$ROMFS" "$MARKER" || die "no RomFS at $ROMFS (missing $MARKER)"'
+    if src.count(anchor) != 1:
         raise RuntimeError(
-            f"Expected exactly one NVN `ios = build_shaders(...)` call in {p}; "
-            f"found {len(matches)}. No post-shader cleanup was added."
+            f"Expected exactly one RomFS marker validation in {p}; found {src.count(anchor)}. "
+            "Refusing to weaken validation."
         )
 
-    i = matches[0]
-    indent = re.match(r"^\s*", lines[i]).group(0)
-    block = (
-        f"{indent}{MARKER_IPA}\n"
-        f"{indent}# The NVN shader step has returned successfully. Its Mac-side\n"
-        f"{indent}# outputs/CAS and the Switch shader package are no longer inputs\n"
-        f"{indent}# to the iOS packer. Keep shader/ios (the IPA's MSL_IOS input).\n"
-        f"{indent}if os.environ.get('NX_CI_RELEASE_SHADER_SPACE') == '1':\n"
-        f"{indent}    for _ci_path in (sh / 'pkg', sh / 'cache'):\n"
-        f"{indent}        if _ci_path.is_dir():\n"
-        f"{indent}            say(f'[CI disk guard] removing consumed shader data: {{_ci_path}}')\n"
-        f"{indent}            shutil.rmtree(_ci_path)\n"
+    replacement = (
+        f"{MARKER_ROMFS_SH}\n"
+        'if [ "${DM_COPY_ROMFS:-YES}" = NO ] && [ ! -f "$ROMFS" ]; then\n'
+        '  t "RomFS image was released after shader split; skipping image marker validation (separate mode)"\n'
+        '  t "no romfs.id will be embedded; the matching complete RomFS.img must be supplied separately"\n'
+        "else\n"
+        f"  {anchor}\n"
+        "fi"
     )
-    lines.insert(i + 1, block)
-    p.write_text("".join(lines), encoding="utf-8")
-    say("[patch] build_ipa_from_nsp.py: after successful NVN shader build, remove shader/pkg and shader/cache")
-    say("[patch] shader/ios is deliberately retained for IPA packaging")
+    src = src.replace(anchor, replacement, 1)
+    p.write_text(src, encoding="utf-8")
+    say("[patch] build_ipa.sh: skip RomFS marker validation only when separate mode has no image")
+    say("[patch] build_ipa.sh: normal validation and romfs.id generation remain enabled when the image exists")
     return True
-
 
 def patch(repo: Path) -> None:
     a = patch_dmsh_build(repo)
     b = patch_ipa_builder(repo)
+    c = patch_build_ipa_sh(repo)
     say(f"[patch] complete: dmsh_build={'changed' if a else 'already patched'}, "
-        f"IPA builder={'changed' if b else 'already patched'}")
+        f"IPA builder={'changed' if b else 'already patched'}, "
+        f"build_ipa.sh={'changed' if c else 'already patched'}")
 
 
 def run_cmd(args: list[str], timeout: int = 120) -> str:
