@@ -47,15 +47,17 @@ jobs:
           ref: ${{ github.ref }}
           path: workflow-tools
 
-      - name: Apply CI disk-safe shader cleanup
-        shell: bash
-        run: |
-          set -euo pipefail
-          python "$GITHUB_WORKSPACE/workflow-tools/.github/scripts/nxnative_ci_guard.py" patch "$GITHUB_WORKSPACE"
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+
+      - name: Apply CI disk-safe shader and RomFS patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          GUARD="$GITHUB_WORKSPACE/workflow-tools/.github/scripts/nxnative_ci_guard.py"
+          python "$GUARD" patch "$GITHUB_WORKSPACE"
 
       - name: Set up .NET SDK
         uses: actions/setup-dotnet@v4
@@ -364,6 +366,7 @@ jobs:
       - name: Detect game title ID and select shader profile
         env:
           PROFILE_OVERRIDE: ${{ inputs.profile_id }}
+          NX_MONITOR_LOG: ${{ runner.temp }}/disk-monitor.log
         shell: bash
         run: |
           set -euo pipefail
@@ -534,38 +537,7 @@ jobs:
             exit 1
           fi
           python "$CHAIN_SCRIPT" --header
-      # ===== 新增：构建前磁盘监控 =====
-      - name: Start Build Disk Monitor
-        shell: bash
-        run: |
-          set -euo pipefail
-          MONITOR="$RUNNER_TEMP/disk-monitor.log"
-          PIDFILE="$RUNNER_TEMP/disk-monitor.pid"
-          GAME_DIR="$RUNNER_TEMP/GameFiles"
-          (
-            while true; do
-              echo ""
-              echo "========== $(date '+%Y-%m-%d %H:%M:%S') =========="
-              echo "--- Filesystem ---"
-              df -h /
-              echo "--- Game Build Directories ---"
-              find "$GAME_DIR" -maxdepth 3 -type d \
-                \( -name '*_build' -o -name shader -o -name cache -o -name ios \) \
-                -exec du -sh {} \; 2>/dev/null || true
-              echo "--- Xcode DerivedData ---"
-              du -sh "$HOME/Library/Developer/Xcode/DerivedData" \
-                2>/dev/null || true
-              echo "--- Temporary Directory ---"
-              du -sh /private/tmp 2>/dev/null || true
-              echo "--- Largest Game Build Directories ---"
-              du -h -d 3 "$GAME_DIR" 2>/dev/null \
-                | sort -hr | head -20 || true
-              sleep 30
-            done
-          ) >> "$MONITOR" 2>&1 &
-          echo $! > "$PIDFILE"
-          echo "Disk monitor started."
-          echo "Log: $MONITOR"
+   
       # ===== 原有 IPA 构建步骤 =====
       - name: Build unsigned IPA
         shell: bash
@@ -573,6 +545,7 @@ jobs:
           DMSH_DISABLE_SHADER_CAS: "1"
           DMSH_TARGETS: ${{ inputs.device == 'iPhone 15 Pro/Pro Max or newer (standard)' && 'ios' || '' }}
           NX_CI_RELEASE_SHADER_SPACE: "1"
+          NX_CI_RELEASE_ROMFS: "1"
         run: |
           set -euo pipefail
           WORK="$RUNNER_TEMP/nxnative"
@@ -584,6 +557,7 @@ jobs:
             "$GAME_DIR" \
             -k "$WORK/prod.keys" \
             --allow-other-metal \
+            --romfs separate \
             -o "$OUTPUT" 2>&1 | tee "$WORK/build-console.log"
           if [[ ! -s "$OUTPUT" ]]; then
             echo "::error::IPA build did not produce an output file."
@@ -614,25 +588,6 @@ jobs:
               du -h -d 1 "$DIR" 2>/dev/null | sort -h
             fi
           done
-      # ===== 新增：停止监控并输出日志 =====
-      - name: Stop Disk Monitor and Print Report
-        if: always()
-        shell: bash
-        run: |
-          set +e
-          MONITOR="$RUNNER_TEMP/disk-monitor.log"
-          PIDFILE="$RUNNER_TEMP/disk-monitor.pid"
-          if [[ -f "$PIDFILE" ]]; then
-            PID="$(cat "$PIDFILE")"
-            kill "$PID" 2>/dev/null
-            wait "$PID" 2>/dev/null
-          fi
-          echo "========== Final Disk Usage =========="
-          df -h /
-          if [[ -f "$MONITOR" ]]; then
-            echo "========== Disk Monitor Log =========="
-            cat "$MONITOR"
-          fi
           
       - name: Stop disk monitor and print report
         if: always()
@@ -640,6 +595,7 @@ jobs:
         env:
           NX_GAME_DIR: ${{ runner.temp }}/GameFiles
           NX_PROGRESS_LOG: ${{ runner.temp }}/nxnative/build-console.log
+          NX_MONITOR_LOG: ${{ runner.temp }}/disk-monitor.log
         run: |
           python "$GITHUB_WORKSPACE/workflow-tools/.github/scripts/nxnative_ci_guard.py" stop
           
@@ -660,7 +616,6 @@ jobs:
           path: |
             ${{ runner.temp }}/GameFiles/*_build/logs/
             ${{ runner.temp }}/GameFiles/*_survey/
-            ${{ runner.temp }}/disk-monitor.log
             ${{ runner.temp }}/disk-monitor.log
             ${{ runner.temp }}/nxnative/build-console.log
           if-no-files-found: ignore
