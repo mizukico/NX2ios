@@ -406,6 +406,60 @@ jobs:
           echo "===== Filesystem Usage ====="
           df -h /
 
+      - name: Inspect Root Volume Used Space
+        shell: bash
+        run: |
+          set +e
+
+          echo "========== 1. Root filesystem =========="
+          df -h /
+
+          echo "========== 2. Root mount information =========="
+          mount | grep -E ' on / |disk2'
+
+          echo "========== 3. Root top-level directories =========="
+          sudo du -x -h -d 1 / 2>/dev/null | sort -h
+
+          echo "========== 4. System directories =========="
+          for p in \
+            /System \
+            /System/Library \
+            /System/Applications \
+            /usr \
+            /usr/lib \
+            /usr/share \
+            /bin \
+            /sbin \
+            /private
+          do
+            if [ -d "$p" ]; then
+              echo "--- $p"
+              sudo du -x -h -d 1 "$p" 2>/dev/null | sort -h
+            fi
+          done
+
+          echo "========== 5. Largest files on root volume =========="
+          sudo find / -xdev -type f -size +100M \
+            -exec du -h {} \; 2>/dev/null | sort -h | tail -100
+
+          echo "========== 6. APFS snapshots =========="
+          diskutil apfs listSnapshots /
+
+          echo "========== 7. Local snapshots =========="
+          tmutil listlocalsnapshots /
+
+          echo "========== 8. Deleted but still open files =========="
+          sudo lsof +L1 2>/dev/null | head -100
+
+          echo "========== 9. Firmlinks =========="
+          cat /usr/share/firmlinks 2>/dev/null
+
+          echo "========== 10. APFS container =========="
+          diskutil apfs list
+
+          echo "========== 11. Final root filesystem =========="
+          df -h /
+
       - name: Clean Up Original Game Downloads
         shell: bash
         run: |
