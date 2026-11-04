@@ -4,7 +4,7 @@ NxNative GitHub Actions disk guard.
 
 Commands:
   preclean <runner_temp>   Remove only stale NxNative-owned temp folders.
-  patch <repo>              Patch dmsh_build.py and build_ipa_from_nsp.py for CI-safe cleanup.
+  patch <repo>              Patch shader build cleanup without shortening dmsh_build.py intermediate lifetimes.
   start                    Start detached disk monitor (environment variables configure paths).
   stop                     Stop monitor and write a final report.
   report                   Print the last 200 lines of the monitor log.
@@ -31,7 +31,8 @@ import time
 from pathlib import Path
 
 
-MARKER_DM = "# NX_CI_DISK_GUARD_TEMP_CLEANUP"
+MARKER_DM = "# NX_CI_DISK_GUARD_SAFE_CAS"
+LEGACY_MARKER_DM = "# NX_CI_DISK_GUARD_TEMP_CLEANUP"
 MARKER_IPA = "# NX_CI_DISK_GUARD_POST_SHADER_CLEANUP"
 
 
@@ -75,69 +76,83 @@ def preclean(runner_temp: Path) -> None:
 
 
 def patch_dmsh_build(repo: Path) -> bool:
+    """Apply only the safe CAS toggle; never delete translator intermediates early.
+
+    dmsh_build.geometry_finish()/finish() can still read a shader's .bin,
+    .spv and reflection files while fin(key) is running. The upstream builder
+    removes the whole temporary directory only after every fin() task finishes.
+    Keep that lifetime unchanged.
+    """
     p = repo / "dm/gfx/tools/dmsh_build.py"
     if not p.is_file():
         raise RuntimeError(f"dmsh_build.py not found: {p}")
     src = p.read_text(encoding="utf-8")
 
-    if MARKER_DM in src:
-        say("[patch] dmsh_build.py already patched")
-        return False
+    # Upgrade checkouts that were patched by the previous, unsafe version of
+    # this guard. Remove its pre-fin .bin/job cleanup block.
+    legacy_pre_fin = re.compile(
+        r"(?ms)^# NX_CI_DISK_GUARD_TEMP_CLEANUP\n"
+        r"# All XLATE worker processes have returned at this point\. Their \.bin\n"
+        r"# inputs and job_\*\.json batch descriptors are no longer read\.\n"
+        r"for _ci_name in os\.listdir\(w\):\n"
+        r"    if _ci_name\.endswith\('\.bin'\) or \(_ci_name\.startswith\('job_'\) and _ci_name\.endswith\('\.json'\)\):\n"
+        r"        try: os\.unlink\(os\.path\.join\(w, _ci_name\)\)\n"
+        r"        except OSError: pass\n\n"
+        r"(?=def fin\(key\):)"
+    )
+    src, removed_pre_fin = legacy_pre_fin.subn("", src)
 
-    # Once all translator processes have returned, their input .bin files and
-    # the batch job_*.json descriptors are dead. Keep .spv/.res.json until each
-    # shader has completed finish().
-    anchor = "def fin(key):"
-    if src.count(anchor) != 1:
+    # Remove the previous per-shader cleanup, which could race paired shader
+    # finishing and geometry_finish(). Restore the original one-line publish.
+    legacy_per_shader = re.compile(
+        r"(?m)^    if result\[1\] == 'ok':\n"
+        r"        if os\.environ\.get\('DMSH_DISABLE_SHADER_CAS'\) != '1':\n"
+        r"            publish_cache\(key, digests\[key\], rule_fps\[key\], CODE_FP\)\n"
+        r"        # finish\(\) has copied the final MSL/reflection/library to out/,\n"
+        r"        # compiled the iOS library, and completed vin/fetch processing\.\n"
+        r"        # A paired vertex shader reads its pixel partner from out/, not w/\.\n"
+        r"        for _ci_name in os\.listdir\(w\):\n"
+        r"            if _ci_name\.startswith\(key \+ '\.'\) or _ci_name\.startswith\(key \+ '_'\):\n"
+        r"                _ci_path = os\.path\.join\(w, _ci_name\)\n"
+        r"                if os\.path\.isfile\(_ci_path\):\n"
+        r"                    try: os\.unlink\(_ci_path\)\n"
+        r"                    except OSError: pass\n"
+        r"        try: os\.unlink\(os\.path\.join\(w, f'job1_\{key\}\.json'\)\)\n"
+        r"        except OSError: pass$"
+    )
+    src, removed_per_shader = legacy_per_shader.subn(
+        "    if result[1] == 'ok': publish_cache(key, digests[key], rule_fps[key], CODE_FP)",
+        src,
+    )
+
+    if MARKER_DM in src:
+        say("[patch] dmsh_build.py already has the safe CAS-only patch")
+        return bool(removed_pre_fin or removed_per_shader)
+
+    if LEGACY_MARKER_DM in src:
         raise RuntimeError(
-            f"Expected exactly one {anchor!r} in {p}; found {src.count(anchor)}. "
-            "No source changes were made."
+            f"Found an unrecognized legacy cleanup patch in {p}. Refusing to modify it; "
+            "inspect the marked block before proceeding."
         )
 
-    pre_fin = (
-        f"{MARKER_DM}\n"
-        "# All XLATE worker processes have returned at this point. Their .bin\n"
-        "# inputs and job_*.json batch descriptors are no longer read.\n"
-        "for _ci_name in os.listdir(w):\n"
-        "    if _ci_name.endswith('.bin') or (_ci_name.startswith('job_') and _ci_name.endswith('.json')):\n"
-        "        try: os.unlink(os.path.join(w, _ci_name))\n"
-        "        except OSError: pass\n"
-        "\n"
-    )
-    src = src.replace(anchor, pre_fin + anchor, 1)
-
-    # Skip the per-shader CAS publication in this ephemeral CI build. The
-    # Metal-source-keyed CAS/metallib and variant caches remain enabled while
-    # the current compilation is running.
-    line_re = re.compile(
-        r"(?m)^    if result\[1\] == 'ok': publish_cache\(key, digests\[key\], rule_fps\[key\], CODE_FP\)\s*$"
-    )
-    if len(line_re.findall(src)) != 1:
+    anchor = "    if result[1] == 'ok': publish_cache(key, digests[key], rule_fps[key], CODE_FP)"
+    if src.count(anchor) != 1:
         raise RuntimeError(
             f"Expected exactly one successful-shader publish_cache line in {p}; "
-            "no safe per-shader cleanup patch was completed."
+            f"found {src.count(anchor)}. No unsafe cleanup was added."
         )
 
     replacement = (
+        f"    {MARKER_DM}\n"
         "    if result[1] == 'ok':\n"
         "        if os.environ.get('DMSH_DISABLE_SHADER_CAS') != '1':\n"
-        "            publish_cache(key, digests[key], rule_fps[key], CODE_FP)\n"
-        "        # finish() has copied the final MSL/reflection/library to out/IOSOUT,\n"
-        "        # compiled the iOS library, and completed vin/fetch processing.\n"
-        "        # A paired vertex shader reads its pixel partner from out/, not w/.\n"
-        "        for _ci_name in os.listdir(w):\n"
-        "            if _ci_name.startswith(key + '.') or _ci_name.startswith(key + '_'):\n"
-        "                _ci_path = os.path.join(w, _ci_name)\n"
-        "                if os.path.isfile(_ci_path):\n"
-        "                    try: os.unlink(_ci_path)\n"
-        "                    except OSError: pass\n"
-        "        try: os.unlink(os.path.join(w, f'job1_{key}.json'))\n"
-        "        except OSError: pass"
+        "            publish_cache(key, digests[key], rule_fps[key], CODE_FP)"
     )
-    src = line_re.sub(lambda _: replacement, src, count=1)
+    src = src.replace(anchor, replacement, 1)
     p.write_text(src, encoding="utf-8")
-    say("[patch] dmsh_build.py: release consumed translator files and per-shader intermediates")
-    say("[patch] dmsh_build.py: DMSH_DISABLE_SHADER_CAS=1 can skip the redundant per-shader CAS copies")
+    say("[patch] dmsh_build.py: CAS publication can be disabled for ephemeral CI builds")
+    say("[patch] dmsh_build.py: .bin/.spv/.res.json/job files are retained until upstream fin() tasks finish")
+    say("[patch] dmsh_build.py: upstream shutil.rmtree(w) remains the only translator-temp cleanup")
     return True
 
 
