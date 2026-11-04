@@ -40,6 +40,19 @@ jobs:
         with:
           repository: seedds/nxnative
           ref: main
+          
+      - name: Checkout workflow helper
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.ref }}
+          path: workflow-tools
+
+      - name: Apply CI disk-safe shader cleanup
+        shell: bash
+        run: |
+          set -euo pipefail
+          python "$GITHUB_WORKSPACE/workflow-tools/.github/scripts/nxnative_ci_guard.py" patch "$GITHUB_WORKSPACE"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -60,6 +73,75 @@ jobs:
           python -m pip install \
             lz4 capstone fonttools backports.zstd gdown
 
+      - name: Remove stale NxNative temporary files
+        shell: bash
+        run: |
+          set -euo pipefail
+          python "$GITHUB_WORKSPACE/workflow-tools/.github/scripts/nxnative_ci_guard.py" preclean "$RUNNER_TEMP"
+          
+      # ==========================================
+      # Xcode 组件磁盘占用盘点
+      # ==========================================
+      - name: Audit Xcode Disk Usage
+        shell: bash
+        continue-on-error: true
+        run: |
+          set +e
+
+          echo "=========================================="
+          echo "          Xcode Storage Audit"
+          echo "=========================================="
+
+          DEVELOPER_DIR="$(xcode-select -p 2>/dev/null)"
+          echo "DEVELOPER_DIR: $DEVELOPER_DIR"
+
+          echo ""
+          echo "========== Xcode Version =========="
+          xcodebuild -version
+
+          echo ""
+          echo "========== Available SDKs =========="
+          xcodebuild -showsdks
+
+          echo ""
+          echo "========== Metal Compiler =========="
+          xcrun --find metal
+          xcrun --find metallib
+
+          echo ""
+          echo "========== Xcode Directory Sizes =========="
+
+          DIRS=(
+            "$HOME/Library/Developer/Xcode"
+            "$HOME/Library/Developer/CoreSimulator"
+            "$HOME/Library/Caches/com.apple.dt.Xcode"
+            "$HOME/Library/Developer/Packages"
+            "$DEVELOPER_DIR/Platforms"
+            "$DEVELOPER_DIR/Toolchains"
+            "$DEVELOPER_DIR/SDKs"
+          )
+
+          for DIR in "${DIRS[@]}"; do
+            if [ -d "$DIR" ]; then
+              echo ""
+              echo "----- $DIR -----"
+              du -sh "$DIR" 2>/dev/null
+              du -h -d 1 "$DIR" 2>/dev/null | sort -h
+            fi
+          done
+
+          echo ""
+          echo "========== Simulator Runtimes =========="
+          xcrun simctl runtime list 2>&1
+
+          echo ""
+          echo "========== Disk Usage =========="
+          df -h /
+          df -i /
+
+          echo ""
+          echo "========== Xcode Audit Complete =========="
+          
       - name: Download game files and keys
         env:
           GAME_URL: ${{ secrets.Game_URL }}
@@ -307,6 +389,15 @@ jobs:
 
           echo "===== After Cleanup ====="
           df -h /
+
+      - name: Start disk monitor
+        shell: bash
+        env:
+          NX_GAME_DIR: ${{ runner.temp }}/GameFiles
+          NX_PROGRESS_LOG: ${{ runner.temp }}/nxnative/build-console.log
+        run: |
+          set -euo pipefail
+          python "$GITHUB_WORKSPACE/workflow-tools/.github/scripts/nxnative_ci_guard.py" start
 
       - name: Detect game title ID and select shader profile
         env:
@@ -579,6 +670,10 @@ jobs:
       # ===== 原有 IPA 构建步骤 =====
       - name: Build unsigned IPA
         shell: bash
+        env:
+          DMSH_DISABLE_SHADER_CAS: "1"
+          DMSH_TARGETS: ${{ inputs.device == 'iPhone 15 Pro/Pro Max or newer (standard)' && 'ios' || '' }}
+          NX_CI_RELEASE_SHADER_SPACE: "1"
         run: |
           set -euo pipefail
           WORK="$RUNNER_TEMP/nxnative"
@@ -592,7 +687,7 @@ jobs:
             "$GAME_DIR" \
             -k "$WORK/prod.keys" \
             --allow-other-metal \
-            -o "$OUTPUT"
+            -o "$OUTPUT" 2>&1 | tee "$WORK/build-console.log"
 
           if [[ ! -s "$OUTPUT" ]]; then
             echo "::error::IPA build did not produce an output file."
@@ -601,6 +696,32 @@ jobs:
 
           echo "IPA successfully created: $OUTPUT"
           ls -lh "$OUTPUT"
+
+      - name: Audit Disk After Build
+        if: always()
+        shell: bash
+        continue-on-error: true
+        run: |
+          echo "========== Disk After Build =========="
+          df -h /
+          df -i /
+
+          DEVELOPER_DIR="$(xcode-select -p 2>/dev/null)"
+
+          for DIR in \
+            "$HOME/Library/Developer/Xcode" \
+            "$HOME/Library/Developer/CoreSimulator" \
+            "$HOME/Library/Caches/com.apple.dt.Xcode" \
+            "$DEVELOPER_DIR/Platforms" \
+            "$DEVELOPER_DIR/Toolchains"
+          do
+            if [ -d "$DIR" ]; then
+              echo ""
+              echo "----- $DIR -----"
+              du -sh "$DIR" 2>/dev/null
+              du -h -d 1 "$DIR" 2>/dev/null | sort -h
+            fi
+          done
 
       # ===== 新增：停止监控并输出日志 =====
       - name: Stop Disk Monitor and Print Report
@@ -625,7 +746,16 @@ jobs:
             echo "========== Disk Monitor Log =========="
             cat "$MONITOR"
           fi
-
+          
+      - name: Stop disk monitor and print report
+        if: always()
+        shell: bash
+        env:
+          NX_GAME_DIR: ${{ runner.temp }}/GameFiles
+          NX_PROGRESS_LOG: ${{ runner.temp }}/nxnative/build-console.log
+        run: |
+          python "$GITHUB_WORKSPACE/workflow-tools/.github/scripts/nxnative_ci_guard.py" stop
+          
       - name: Upload IPA
         if: success()
         uses: actions/upload-artifact@v4
@@ -644,6 +774,8 @@ jobs:
             ${{ runner.temp }}/GameFiles/*_build/logs/
             ${{ runner.temp }}/GameFiles/*_survey/
             ${{ runner.temp }}/disk-monitor.log
+            ${{ runner.temp }}/disk-monitor.log
+            ${{ runner.temp }}/nxnative/build-console.log
           if-no-files-found: ignore
           retention-days: 7
 
