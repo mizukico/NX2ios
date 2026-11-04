@@ -141,6 +141,45 @@ jobs:
 
           echo ""
           echo "========== Xcode Audit Complete =========="
+
+      - name: Free Disk Space - Remove Unneeded Xcode Components
+        shell: bash
+        continue-on-error: true
+        run: |
+          set +e
+
+          echo "========== Disk Before Cleanup =========="
+          df -h /
+
+          echo ""
+          echo "========== Simulator Runtimes =========="
+          xcrun simctl runtime list -v
+
+          echo ""
+          echo "========== Remove Unneeded Runtimes =========="
+
+          # 获取当前已安装的 Runtime 标识符
+          xcrun simctl runtime list -v
+
+          # 删除非 iOS 模拟器运行环境
+          # 具体 UUID/Bundle ID 必须以当前 Runner 返回值为准
+          # 不直接删除 Cryptex 挂载目录
+
+          echo ""
+          echo "========== Clean Xcode DerivedData =========="
+          rm -rf "$HOME/Library/Developer/Xcode/DerivedData/"*
+
+          echo ""
+          echo "========== Clean Xcode Caches =========="
+          rm -rf "$HOME/Library/Caches/com.apple.dt.Xcode/"*
+
+          echo ""
+          echo "========== Clean CoreSimulator Caches =========="
+          rm -rf "$HOME/Library/Developer/CoreSimulator/Caches/"*
+
+          echo ""
+          echo "========== Disk After Cleanup =========="
+          df -h /
           
       - name: Download game files and keys
         env:
