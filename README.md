@@ -2,7 +2,7 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-Build an unsigned iOS IPA with [NxNative](https://github.com/seedds/nxnative) through GitHub Actions, using a cloud macOS runner. This repository provides the workflow and CI helper patches; it does not include game files, title keys, or upstream NxNative source code.
+Build an unsigned iOS IPA with [NxNative](https://github.com/seedds/nxnative) through GitHub Actions on a cloud macOS runner. This project is an optimization of the workflow described in the [original Reddit guide](https://www.reddit.com/r/NativePortsOniOS/comments/1xh334e/how_to_compile_switch_games_into_native_ios_apps/), with a primary focus on reducing macOS runner disk usage. It provides the workflow and CI helper patches; it does not include game files, title keys, or upstream NxNative source code.
 
 > **Status:** Community-maintained workflow. A successful build does not guarantee that a particular game will boot or run correctly on every iPhone or iOS version.
 
@@ -27,7 +27,7 @@ These labels select build configurations; they are not compatibility guarantees.
 - **Standard-path RomFS handoff:** the Standard/NVN path pauses after shader splitting and before Metal compilation, uploads the standalone `RomFS.img` as the `NxNative-ROMFS` artifact, then resumes the cached build and releases the local RomFS image to save disk space.
 - **Build artifacts:** uploads the resulting unsigned IPA and available build logs.
 
-The BC fallback uses its own pinned upstream revision and does not receive the Standard-only `--romfs separate` argument or the Standard RomFS handoff.
+**BC fallback warning:** the BC fallback branch has not received the same disk-space optimizations and has not been specifically validated by this repository's testing. Its build may fail, and even a completed IPA is not a guarantee that the game will launch or run. No result is guaranteed for this branch.
 
 ## Requirements
 
@@ -72,7 +72,48 @@ When the run finishes, open its summary and download the artifacts:
 - **`NxNative-ROMFS`** — the standalone RomFS image uploaded by the Standard path when the NVN handoff is used.
 - **`NxNative-Build-Logs`** — diagnostic logs and available game survey/build log folders.
 
-GitHub downloads artifacts as ZIP files. Extract the IPA from its ZIP before using your normal iOS sideloading method. The ROMFS artifact is a separate build output; it is not the IPA.
+GitHub downloads artifacts as ZIP files. Extract both files. **For the Standard/NVN `--romfs separate` build, you need BOTH the IPA and the matching `RomFS.img`; the IPA alone does not contain the game data and is not sufficient to play.**
+
+After installing the IPA, place the image in the installed app's container at:
+
+`<App Container>/Documents/romfs.img`
+
+Use the exact filename `romfs.img` (lowercase). Do not put it inside `DmIOS.app`, `Payload`, or the app's `romfs` resource folder. The upstream project provides [`scripts/push_romfs.sh`](https://github.com/seedds/nxnative/blob/main/scripts/push_romfs.sh) to copy the image to the app's Documents directory; its [packing/deployment documentation](https://github.com/seedds/nxnative/blob/main/docs/development.md) describes the separate-RomFS deployment. Run the helper while the app is installed, using the device UDID, the app bundle ID, and the downloaded image. The image must match the game/version used to build the IPA; when the game version or extraction changes, transfer the matching image again.
+
+The `NxNative-ROMFS` artifact is a separate game-data image, not an installable app.
+
+## Disk-space optimizations
+
+The main engineering goal of this repository is to reduce peak disk usage on the GitHub-hosted macOS runner, especially during the memory- and disk-intensive Metal shader compilation stage. The workflow applies these measures:
+
+1. **Remove source download/staging files after extraction.** Once the game packages have been prepared in the build input directory, the workflow deletes the downloaded `.download` copies and temporary extracted RAR directories. The actual game packages required by NxNative are retained.
+2. **Upload `RomFS.img` after shader splitting.** On the supported Standard/NVN separate-RomFS path, the builder pauses after shader splitting and before Metal compilation. The standalone RomFS image is uploaded as the `NxNative-ROMFS` artifact while it still exists on the runner.
+3. **Delete the local `RomFS.img` before Metal compilation.** After the artifact upload, the workflow re-enters the cached build. The CI patch removes the local RomFS image before Metal compilation, maximizing the disk space available to Xcode/Metal.
+4. **Build the IPA with `--romfs separate`.** Since the local image has been released, the IPA is packaged without embedding the game RomFS. The matching image is delivered separately and must be copied to the app container's `Documents/romfs.img`.
+
+### Measured example: Final Fantasy Resonance (Asian edition)
+
+The disk optimizations were developed primarily around **Final Fantasy Resonance (Asian edition)**. In a measured build of this title:
+
+| Output / measurement | Observed value |
+| --- | ---: |
+| Final unsigned IPA | **6.58 GB** |
+| Separate `RomFS.img` | **8.35 GB** |
+| Lowest free disk space during the Metal compilation peak, after the original XCI and local `RomFS.img` had been removed | **430 MB** |
+
+This is an observed result from that particular build, not a general capacity guarantee or a benchmark for every game. The combined IPA and RomFS image are much larger than the original XCI in this case. That may be a characteristic of this game's content, extraction, and build outputs; other games can have very different size and disk-usage profiles. The 430 MB remaining-space figure also shows that this workflow is still close to the runner's storage limit for this workload.
+
+### CI helper: `.github/scripts/nxnative_ci_guard.py`
+
+The added Python script is not a game patch and does not modify game content. It provides workflow-specific disk management and safe build-script integration:
+
+- **Pre-clean:** removes only stale workflow-owned `GameFiles` / `nxnative` directories and old disk-monitor files from the runner temp directory; it deliberately leaves shared Homebrew, Xcode, and runner-wide caches alone.
+- **Patch upstream build scripts:** adjusts the shader build cleanup behavior without deleting intermediate shader files before all shader-finalization tasks have finished, avoiding a cleanup race.
+- **Manage the RomFS two-pass build:** patches the Standard upstream builder to stop after successful shader splitting, stage the image for artifact upload, and remove the local image on the second pass before Metal compilation.
+- **Keep separate-RomFS IPA packaging valid:** patches `build_ipa.sh` to skip the RomFS marker check only when separate mode is selected and the image has intentionally been released. Normal validation remains in place when the image exists.
+- **Disk monitoring and reporting:** records free disk space, filesystem usage, build progress, and sizes of relevant build directories at intervals; the final report helps identify which stage consumes the runner's storage.
+
+The script is invoked by the workflow for pre-cleaning, patching, starting/stopping the monitor, and reporting. It is what coordinates the repository's disk-space safeguards; it does not itself perform the game extraction or Metal compilation.
 
 ## Build flow
 
