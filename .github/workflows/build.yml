@@ -540,52 +540,68 @@ jobs:
    
       # ===== First pass: extract, rewrite and split shaders; stop before Metal =====
       - name: Prepare shader split and RomFS for upload
+        id: prepare
         shell: bash
         env:
           DMSH_DISABLE_SHADER_CAS: "1"
-          DMSH_TARGETS: \${{ inputs.device == 'iPhone 15 Pro/Pro Max or newer (standard)' && 'ios' || '' }}
-          NX_CI_STOP_AFTER_SPLIT: "1"
-          NX_CI_ROMFS_HANDOFF_DIR: \${{ runner.temp }}/romfs-handoff
+          DMSH_TARGETS: ${{ inputs.device == 'iPhone 15 Pro/Pro Max or newer (standard)' && 'ios' || '' }}
+          NX_CI_STOP_AFTER_SPLIT: ${{ inputs.device == 'iPhone 15 Pro/Pro Max or newer (standard)' && '1' || '' }}
+          NX_CI_ROMFS_HANDOFF_DIR: ${{ runner.temp }}/romfs-handoff
         run: |
           set -euo pipefail
           WORK="$RUNNER_TEMP/nxnative"
           GAME_DIR="$RUNNER_TEMP/GameFiles"
           OUTPUT="$RUNNER_TEMP/NxNative.ipa"
-          rm -f "$OUTPUT"
           mkdir -p "$RUNNER_TEMP/romfs-handoff"
-          echo "===== Before Shader Preparation ====="
+          rm -f "$OUTPUT" "$RUNNER_TEMP/romfs-handoff/ready" "$RUNNER_TEMP/romfs-handoff/RomFS.img"
+
+          echo "===== Before First Pass ====="
           df -h /
-          python scripts/build_ipa_from_nsp.py \
-            "$GAME_DIR" \
-            -k "$WORK/prod.keys" \
-            --allow-other-metal \
-            --romfs separate \
-            -o "$OUTPUT" 2>&1 | tee "$WORK/build-console.log"
-          if [[ -s "$OUTPUT" ]]; then
-            echo "This graphics path completed the IPA in the first pass; no pre-Metal pause was needed."
-          elif [[ -s "$RUNNER_TEMP/romfs-handoff/ready" ]]; then
-            echo "Shader split completed. RomFS is ready for the Artifact upload step."
+
+          ARGS=(
+            "$GAME_DIR"
+            -k "$WORK/prod.keys"
+            --allow-other-metal
+          )
+
+          # Only the Standard upstream supports image-backed --romfs separate.
+          if [[ "${{ inputs.device }}" == "iPhone 15 Pro/Pro Max or newer (standard)" ]]; then
+            ARGS+=(--romfs separate)
+            echo "Standard mode: pause after NVN shader split for RomFS upload."
           else
-            echo "::error::The builder stopped without producing an IPA or a RomFS handoff marker."
+            echo "BC fallback: use its original bundled-RomFS build path."
+          fi
+
+          python scripts/build_ipa_from_nsp.py \
+            "${ARGS[@]}" \
+            -o "$OUTPUT" 2>&1 | tee "$WORK/build-console.log"
+
+          if [[ -s "$RUNNER_TEMP/romfs-handoff/ready" && -s "$RUNNER_TEMP/romfs-handoff/RomFS.img" ]]; then
+            echo "romfs_ready=true" >> "$GITHUB_OUTPUT"
+            echo "Shader split completed; standalone RomFS.img is ready for upload."
+            ls -lh "$RUNNER_TEMP/romfs-handoff/RomFS.img"
+          elif [[ -s "$OUTPUT" ]]; then
+            echo "romfs_ready=false" >> "$GITHUB_OUTPUT"
+            echo "This build path completed the IPA in the first pass; no RomFS handoff is needed."
+          else
+            echo "::error::First pass produced neither a complete IPA nor a valid RomFS handoff."
             exit 1
           fi
 
-      # This uploads the hard link created by the guard. It does not create
-      # another full local copy of RomFS.img; compression is disabled.
+      # Upload only when the Standard/NVN first pass actually created the handoff.
       - name: Upload RomFS before Metal compilation
-        if: success()
+        if: success() && steps.prepare.outputs.romfs_ready == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: NxNative-ROMFS
-          path: \${{ runner.temp }}/romfs-handoff/RomFS.img
-          if-no-files-found: ignore
+          path: ${{ runner.temp }}/romfs-handoff/RomFS.img
+          if-no-files-found: error
           compression-level: 0
           retention-days: 7
 
-      # Remove only the staging hard link. The original image remains until
-      # the second builder pass reaches the post-split release point.
+      # Remove the staging hard link; the original image is released by the second pass.
       - name: Remove RomFS upload staging link
-        if: success()
+        if: success() && steps.prepare.outputs.romfs_ready == 'true'
         shell: bash
         run: |
           rm -f "$RUNNER_TEMP/romfs-handoff/RomFS.img"
@@ -596,30 +612,41 @@ jobs:
         shell: bash
         env:
           DMSH_DISABLE_SHADER_CAS: "1"
-          DMSH_TARGETS: \${{ inputs.device == 'iPhone 15 Pro/Pro Max or newer (standard)' && 'ios' || '' }}
+          DMSH_TARGETS: ${{ inputs.device == 'iPhone 15 Pro/Pro Max or newer (standard)' && 'ios' || '' }}
           NX_CI_RELEASE_SHADER_SPACE: "1"
-          NX_CI_RELEASE_ROMFS: "1"
+          NX_CI_RELEASE_ROMFS: ${{ inputs.device == 'iPhone 15 Pro/Pro Max or newer (standard)' && '1' || '' }}
         run: |
           set -euo pipefail
           WORK="$RUNNER_TEMP/nxnative"
           GAME_DIR="$RUNNER_TEMP/GameFiles"
           OUTPUT="$RUNNER_TEMP/NxNative.ipa"
+
           if [[ ! -s "$OUTPUT" ]]; then
             echo "===== Re-entering cached build to release RomFS and compile Metal ====="
             df -h /
+
+            ARGS=(
+              "$GAME_DIR"
+              -k "$WORK/prod.keys"
+              --allow-other-metal
+            )
+
+            if [[ "${{ inputs.device }}" == "iPhone 15 Pro/Pro Max or newer (standard)" ]]; then
+              ARGS+=(--romfs separate)
+            fi
+
             python scripts/build_ipa_from_nsp.py \
-              "$GAME_DIR" \
-              -k "$WORK/prod.keys" \
-              --allow-other-metal \
-              --romfs separate \
+              "${ARGS[@]}" \
               -o "$OUTPUT" 2>&1 | tee -a "$WORK/build-console.log"
           else
-            echo "IPA was already completed by a graphics path that does not use the NVN pre-Metal handoff."
+            echo "IPA was already completed during the first pass; skipping the second build."
           fi
+
           if [[ ! -s "$OUTPUT" ]]; then
             echo "::error::IPA build did not produce an output file."
             exit 1
           fi
+
           echo "IPA successfully created: $OUTPUT"
           ls -lh "$OUTPUT"
       - name: Audit Disk After Build
