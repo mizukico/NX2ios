@@ -15,7 +15,7 @@ on:
         description: "Base game title ID (manual override; clear for automatic detection)"
         required: false
         type: string
-        default: ""
+        default: "0100B8A026F14000"
 
 permissions:
   contents: read
