@@ -97,8 +97,9 @@ The disk optimizations were developed primarily around **Final Fantasy Resonance
 
 | Output / measurement | Observed value |
 | --- | ---: |
-| Final unsigned IPA | **6.58 GB** |
+| original XCI | **8.57 GB** |
 | Separate `RomFS.img` | **8.35 GB** |
+| Final unsigned IPA | **6.58 GB** |
 | Lowest free disk space during the Metal compilation peak, after the original XCI and local `RomFS.img` had been removed | **430 MB** |
 
 This is an observed result from that particular build, not a general capacity guarantee or a benchmark for every game. The combined IPA and RomFS image are much larger than the original XCI in this case. That may be a characteristic of this game's content, extraction, and build outputs; other games can have very different size and disk-usage profiles. The 430 MB remaining-space figure also shows that this workflow is still close to the runner's storage limit for this workload.
