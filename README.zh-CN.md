@@ -1,4 +1,4 @@
-# NX2ios — 使用 GitHub Actions 构建 iOS IPA
+# NX4Actions — 使用 GitHub Actions 构建 iOS IPA
 
 [English](README.md) | **简体中文**
 
