@@ -1,4 +1,4 @@
-# NX2ios — Build Nintendo Switch Game Ports for iOS
+# NX4Actions — Build Nintendo Switch Game Ports for iOS
 
 **English** | [简体中文](README.zh-CN.md)
 
