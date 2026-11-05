@@ -7,7 +7,7 @@ on:
         description: "Choose the target device and texture support path"
         required: true
         type: choice
-        default: "iPhone 15 or older (BC fallback)"
+        default: "iPhone 15 Pro/Pro Max or newer (standard)"
         options:
           - "iPhone 15 or older (BC fallback)"
           - "iPhone 15 Pro/Pro Max or newer (standard)"
@@ -15,7 +15,7 @@ on:
         description: "Base game title ID (manual override; clear for automatic detection)"
         required: false
         type: string
-        default: "0100DCA0064A2000"
+        default: ""
 
 permissions:
   contents: read
