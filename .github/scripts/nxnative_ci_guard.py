@@ -36,6 +36,7 @@ LEGACY_MARKER_DM = "# NX_CI_DISK_GUARD_TEMP_CLEANUP"
 MARKER_IPA = "# NX_CI_DISK_GUARD_POST_SHADER_CLEANUP"
 MARKER_ROMFS_MAIN = "# NX_CI_DISK_GUARD_RELEASE_ROMFS_AFTER_SPLIT"
 MARKER_ROMFS_SH = "# NX_CI_DISK_GUARD_SKIP_MISSING_ROMFS_VALIDATION"
+MARKER_UE_IOSTORE = "# NX_CI_UE_IOSTORE_SHADER_DECODE"
 
 
 def say(s: str) -> None:
@@ -157,6 +158,76 @@ def patch_dmsh_build(repo: Path) -> bool:
     say("[patch] dmsh_build.py: upstream shutil.rmtree(w) remains the only translator-temp cleanup")
     return True
 
+
+
+def patch_profile_guess(repo: Path) -> bool:
+    """Include IoStore shader-library containers in the UE shader-decode trigger.
+
+    UE5 games can keep ShaderCodeLibrary data in .utoc/.ucas without a pak
+    shader archive. build_sources() previously counted only Unreal paks, so
+    ue_decode stayed false and decode_ue_shaders() never ran for those games.
+    """
+    p = repo / "dm/games/profile_guess.py"
+    if not p.is_file():
+        raise RuntimeError(f"profile_guess.py not found: {p}")
+    src = p.read_text(encoding="utf-8")
+    if MARKER_UE_IOSTORE in src:
+        say("[patch] profile_guess.py already detects IoStore shader libraries")
+        return False
+
+    signature = (
+        "def shader_sources(imports, glsl_src, glslc_mods, spirv, unreal_paks, "
+        "trinity_packs=0, legacy_paks=0, gl_names=0, gl_src=0, gl_files=0, "
+        "oodle_pkz=0, nro_imports=frozenset(), oodle_gfpak=0, oodle_ue3=0, "
+        "frostbite=False, romfs_glsl=0):"
+    )
+    new_signature = signature[:-2] + ", io_shader_libraries=0):"
+    old_ue_decode = (
+        "'ue_decode': (not vulkan and not gl and bool(unreal_paks), "
+        "f'{unreal_paks} Unreal pak(s): the shaders are Oodle-compressed in their "
+        "shader code archives (Octopath Traveler 0), decoded by booting the game on the Mac'),"
+    )
+    new_ue_decode = (
+        "'ue_decode': (not vulkan and not gl and bool(unreal_paks or io_shader_libraries), "
+        "f'{unreal_paks} Unreal pak(s), {io_shader_libraries} IoStore shader library "
+        "container(s): decode Unreal shader archives in the UE shader-decode step'),"
+    )
+    import_anchor = (
+        "    sys.path.insert(0, str(HERE.parent / 'gfx/tools')); import uepak\n"
+    )
+    import_replacement = (
+        import_anchor
+        + "    " + MARKER_UE_IOSTORE + "\n"
+        + "    io_shader_libraries = len(uepak.io_shader_tocs(str(romfs)))\n"
+    )
+    call_anchor = (
+        "frostbite=frostbite.is_frostbite(str(romfs)), romfs_glsl=romfs_glsl)"
+    )
+    call_replacement = (
+        "frostbite=frostbite.is_frostbite(str(romfs)), "
+        "romfs_glsl=romfs_glsl, io_shader_libraries=io_shader_libraries)"
+    )
+
+    for label, old in (
+        ("shader_sources signature", signature),
+        ("UE decode decision", old_ue_decode),
+        ("uepak import", import_anchor),
+        ("shader_sources call", call_anchor),
+    ):
+        count = src.count(old)
+        if count != 1:
+            raise RuntimeError(
+                f"Expected exactly one {label} anchor in {p}; found {count}. "
+                "Refusing to apply a partial IoStore patch."
+            )
+
+    src = src.replace(signature, new_signature, 1)
+    src = src.replace(old_ue_decode, new_ue_decode, 1)
+    src = src.replace(import_anchor, import_replacement, 1)
+    src = src.replace(call_anchor, call_replacement, 1)
+    p.write_text(src, encoding="utf-8")
+    say("[patch] profile_guess.py: IoStore ShaderCodeLibrary containers now trigger UE shader decode")
+    return True
 
 def patch_ipa_builder(repo: Path) -> bool:
     """Patch the standard NxNative builder for post-split RomFS release.
@@ -336,9 +407,11 @@ def patch_build_ipa_sh(repo: Path) -> bool:
 
 def patch(repo: Path) -> None:
     a = patch_dmsh_build(repo)
+    ue = patch_profile_guess(repo)
     b = patch_ipa_builder(repo)
     c = patch_build_ipa_sh(repo)
     say(f"[patch] complete: dmsh_build={'changed' if a else 'already patched'}, "
+        f"profile_guess IoStore={'changed' if ue else 'already patched'}, "
         f"IPA builder={'changed' if b else 'already patched'}, "
         f"build_ipa.sh={'changed' if c else 'already patched'}")
 
