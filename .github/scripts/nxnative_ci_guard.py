@@ -171,45 +171,70 @@ def patch_ipa_builder(repo: Path) -> bool:
     src = p.read_text(encoding="utf-8")
     changed = False
 
-    # Release the main-game RomFS image after shader_split.py has completed.
-    if MARKER_ROMFS_MAIN not in src:
+    # Only the newer upstream builder has image-backed RomFS and --romfs separate.
+    # The BC fallback checkout is older and keeps a directory-based RomFS bundled.
+    supports_separate = (
+        "romfs_mode = args.romfs or ROMFS" in src
+        and "import romfs as rfs" in src
+    )
+    if MARKER_ROMFS_MAIN not in src and supports_separate:
         anchor = "        if observed_glslc is not None: check_glslc_coverage(observed_glslc, g)\n"
         if src.count(anchor) != 1:
             raise RuntimeError(
                 "Could not find the unique post-split/pre-Metal anchor in "
-                f"{p}; no RomFS deletion patch was applied."
+                f"{p}; no RomFS handoff patch was applied."
             )
         block = (
             f"        {MARKER_ROMFS_MAIN}\n"
-            "        # NVN's split_shaders() has returned: the Metal compiler reads\n"
-            "        # shader/pkg and rewritten modules, not the original RomFS image.\n"
-            "        # Do not apply this to Vulkan/GL: their shader builders still read RomFS.\n"
+            "        # The shader split has returned; pause here so the workflow can upload\n"
+            "        # the original image before releasing it and starting the Metal build.\n"
             "        if (os.environ.get('NX_CI_RELEASE_ROMFS') == '1'\n"
             "                and romfs_mode == 'separate' and gfx == 'nvn'):\n"
+            "            _ci_candidates = [dirs[_ci_version] for _ci_version in sv] + [game]\n"
             "            _ci_seen_romfs = set()\n"
-            "            for _ci_version in sv:\n"
-            "                _ci_image = Path(rfs.source(dirs[_ci_version])).resolve()\n"
+            "            _ci_images = []\n"
+            "            for _ci_dir in _ci_candidates:\n"
+            "                _ci_image = Path(rfs.source(_ci_dir)).resolve()\n"
             "                if _ci_image in _ci_seen_romfs:\n"
             "                    continue\n"
             "                _ci_seen_romfs.add(_ci_image)\n"
             "                try:\n"
             "                    _ci_image.relative_to(work.resolve())\n"
             "                except ValueError:\n"
-            "                    raise BuildError(f'refusing to remove RomFS outside the build folder: {_ci_image}')\n"
+            "                    raise BuildError(f'refusing to release RomFS outside the build folder: {_ci_image}')\n"
             "                if _ci_image.is_file():\n"
-            "                    _ci_size = _ci_image.stat().st_size\n"
-            "                    _ci_free_before = shutil.disk_usage(_ci_image.parent).free\n"
-            "                    _ci_image.unlink()\n"
-            "                    _ci_free_after = shutil.disk_usage(_ci_image.parent).free\n"
-            "                    _ci_delta = _ci_free_after - _ci_free_before\n"
-            "                    say(f'[CI disk guard] removed RomFS after shader split: {_ci_image} ({_ci_size / 2**30:.2f} GiB)')\n"
-            "                    say(f'[CI disk guard] disk free: {_ci_free_before / 2**30:.2f} -> {_ci_free_after / 2**30:.2f} GiB; actual increase: {_ci_delta / 2**30:+.2f} GiB')\n"
+            "                    _ci_images.append((_ci_image, _ci_image.stat().st_size))\n"
+            "            _ci_handoff_value = os.environ.get('NX_CI_ROMFS_HANDOFF_DIR')\n"
+            "            if _ci_handoff_value:\n"
+            "                _ci_handoff = Path(_ci_handoff_value).resolve()\n"
+            "                _ci_handoff.mkdir(parents=True, exist_ok=True)\n"
+            "                if _ci_images:\n"
+            "                    _ci_manifest = _ci_handoff / 'images.txt'\n"
+            "                    _ci_manifest.write_text(''.join(f'{p}\\n' for p, _ in _ci_images), encoding='utf-8')\n"
+            "                    (_ci_handoff / 'ready').write_text('upload required\\n', encoding='utf-8')\n"
+            "                    say(f'[CI disk guard] RomFS handoff ready: {len(_ci_images)} image(s); waiting for Actions Artifact upload')\n"
+            "                    while not (_ci_handoff / 'continue').is_file() and not (_ci_handoff / 'abort').is_file():\n"
+            "                        time.sleep(2)\n"
+            "                    if (_ci_handoff / 'abort').is_file():\n"
+            "                        raise BuildError('RomFS Artifact upload failed or was skipped; original image(s) retained')\n"
             "                else:\n"
-            "                    say(f'[CI disk guard] RomFS is not a regular image file; kept: {_ci_image}')\n"
+            "                    (_ci_handoff / 'no-image').write_text('no regular RomFS.img found\\n', encoding='utf-8')\n"
+            "                    say('[CI disk guard] no standalone RomFS.img found; continuing without the upload handoff')\n"
+            "            for _ci_image, _ci_size in _ci_images:\n"
+            "                if not _ci_image.is_file() or _ci_image.stat().st_size != _ci_size:\n"
+            "                    raise BuildError(f'RomFS image changed or disappeared before release: {_ci_image}')\n"
+            "                _ci_free_before = shutil.disk_usage(_ci_image.parent).free\n"
+            "                _ci_image.unlink()\n"
+            "                _ci_free_after = shutil.disk_usage(_ci_image.parent).free\n"
+            "                _ci_delta = _ci_free_after - _ci_free_before\n"
+            "                say(f'[CI disk guard] removed uploaded RomFS: {_ci_image} ({_ci_size / 2**30:.2f} GiB)')\n"
+            "                say(f'[CI disk guard] disk free: {_ci_free_before / 2**30:.2f} -> {_ci_free_after / 2**30:.2f} GiB; actual increase: {_ci_delta / 2**30:+.2f} GiB')\n"
         )
         src = src.replace(anchor, anchor + block, 1)
         changed = True
-        say("[patch] build_ipa_from_nsp.py: delete main RomFS image after successful NVN shader split")
+        say("[patch] build_ipa_from_nsp.py: pause after NVN shader split for workflow-managed RomFS upload")
+    elif not supports_separate:
+        say("[patch] upstream builder has no image-backed --romfs separate mode; skipping RomFS release patch")
 
     # Keep the existing post-Metal cleanup of consumed Switch-side shader data.
     if MARKER_IPA not in src:
@@ -239,9 +264,8 @@ def patch_ipa_builder(repo: Path) -> bool:
         changed = True
         say("[patch] build_ipa_from_nsp.py: retain shader/ios; remove shader/pkg and shader/cache after Metal")
 
-    # If RomFS was deliberately released, don't print a push command for a
-    # path that no longer exists. The caller supplies the matching image later.
-    if "NX_CI_DISK_GUARD_ROMFS_PUSH_NOTICE" not in src:
+    # Avoid printing a push command for a path deliberately released after upload.
+    if supports_separate and "NX_CI_DISK_GUARD_ROMFS_PUSH_NOTICE" not in src:
         push_anchor = "    say('the game files are not in this build. Copy them to the phone once, with the app installed (it is needed again only when the image changed, a new game version or another extraction):')\n"
         if src.count(push_anchor) != 1:
             raise RuntimeError(f"Could not find the unique say_push_romfs() notice in {p}.")
@@ -280,6 +304,9 @@ def patch_build_ipa_sh(repo: Path) -> bool:
 
     anchor = 'python3 "$DM/tools/romfs.py" "$ROMFS" "$MARKER" || die "no RomFS at $ROMFS (missing $MARKER)"'
     if src.count(anchor) != 1:
+        if "DM_COPY_ROMFS" not in src:
+            say("[patch] build_ipa.sh has no separate-ROMFS mode; skipping missing-image validation patch")
+            return False
         raise RuntimeError(
             f"Expected exactly one RomFS marker validation in {p}; found {src.count(anchor)}. "
             "Refusing to weaken validation."
