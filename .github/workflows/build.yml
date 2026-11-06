@@ -554,9 +554,9 @@ jobs:
                               name_offset = struct.unpack_from("<I", entries, i * 0x18 + 0x10)[0]
                               if name_offset >= len(strings):
                                   continue
-                              end = strings.find(b"\\0", name_offset)
+                              end = strings.find(b"\0", name_offset)
                               if end >= 0 and re.fullmatch(
-                                  rb"[0-9A-Fa-f]{32}\\.tik", strings[name_offset:end]
+                                  rb"[0-9A-Fa-f]{32}\.tik", strings[name_offset:end]
                               ):
                                   return True
                   return False
@@ -566,7 +566,7 @@ jobs:
           untagged = [
               p for p in packages
               if not has_ticket(p)
-              and not re.search(r"\\[[0-9A-Fa-f]{16}\\]", p.name)
+              and not re.search(r"\[[0-9A-Fa-f]{16}\]", p.name)
           ]
           if len(untagged) == 1:
               source = untagged[0]
