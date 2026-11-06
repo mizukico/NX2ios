@@ -520,6 +520,71 @@ jobs:
             echo "::error::Profile ID must be exactly 16 hexadecimal characters."
             exit 1
           fi
+          if [[ -n "${PROFILE_OVERRIDE:-}" ]]; then
+            # A community/homebrew NSP may have neither a ticket nor a title-ID tag.
+            # NxNative's title reader accepts [TITLE_ID] in the package filename.
+            python - "$GAME_DIR" "$PROFILE_ID" <<'PY'
+          import re
+          import struct
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1])
+          title_id = sys.argv[2].upper()
+          packages = [
+              p for p in root.iterdir()
+              if p.is_file() and p.suffix.lower() in {".nsp", ".xci", ".nsz", ".xcz"}
+          ]
+
+          def has_ticket(path):
+              try:
+                  with path.open("rb") as f:
+                      if path.suffix.lower() in {".nsp", ".nsz"}:
+                          header = f.read(16)
+                          if len(header) != 16 or header[:4] != b"PFS0":
+                              return False
+                          count, string_size = struct.unpack_from("<II", header, 4)
+                          if count > 100000 or string_size > 100000000:
+                              return False
+                          entries = f.read(count * 0x18)
+                          strings = f.read(string_size)
+                          if len(entries) != count * 0x18:
+                              return False
+                          for i in range(count):
+                              name_offset = struct.unpack_from("<I", entries, i * 0x18 + 0x10)[0]
+                              if name_offset >= len(strings):
+                                  continue
+                              end = strings.find(b"\\0", name_offset)
+                              if end >= 0 and re.fullmatch(
+                                  rb"[0-9A-Fa-f]{32}\\.tik", strings[name_offset:end]
+                              ):
+                                  return True
+                  return False
+              except (OSError, struct.error):
+                  return False
+
+          untagged = [
+              p for p in packages
+              if not has_ticket(p)
+              and not re.search(r"\\[[0-9A-Fa-f]{16}\\]", p.name)
+          ]
+          if len(untagged) == 1:
+              source = untagged[0]
+              target = source.with_name(f"{source.stem} [{title_id}]{source.suffix}")
+              if target.exists():
+                  raise SystemExit(f"Cannot add title-ID tag; target already exists: {target.name}")
+              source.rename(target)  # same-volume rename; does not duplicate the NSP
+              print(f"Added fallback title-ID tag: {source.name} -> {target.name}")
+          elif len(untagged) > 1:
+              raise SystemExit(
+                  "Manual profile ID was supplied, but multiple packages have no ticket/title-ID tag. "
+                  "Cannot safely decide which one is the base game: "
+                  + ", ".join(p.name for p in untagged)
+              )
+          else:
+              print("No untagged package needs a filename title-ID fallback.")
+          PY
+          fi
           echo "Selected base title ID: $DETECTED_ID"
           echo "Shader profile ID: $PROFILE_ID"
           echo "DM_GAME=$PROFILE_ID" >> "$GITHUB_ENV"
