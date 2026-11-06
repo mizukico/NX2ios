@@ -516,8 +516,8 @@ jobs:
           fi
           PROFILE_ID="${PROFILE_OVERRIDE:-$DETECTED_ID}"
           PROFILE_ID="$(echo "$PROFILE_ID" | tr '[:lower:]' '[:upper:]')"
-          if [[ ! "$PROFILE_ID" =~ ^[0-9A-F]{16}$ ]]; then
-            echo "::error::Profile ID must be exactly 16 hexadecimal characters."
+          if [[ ! "$PROFILE_ID" =~ ^[0-9A-F]{13}000$ ]]; then
+            echo "::error::Base profile ID must be 16 hexadecimal characters and end in 000."
             exit 1
           fi
           if [[ -n "${PROFILE_OVERRIDE:-}" ]]; then
